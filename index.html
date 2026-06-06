@@ -1,13 +1,27 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>My Google AI Studio App</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
+export type AspectRatio = 'original' | '1x1';
 
+export interface DitherShape {
+  id: string;
+  name: string;
+  svgContent: string; // Plain SVG string
+  color: string;      // Color for this state
+  enabled: boolean;
+}
+
+export type ScaleLogic = 'constant' | 'linear_up' | 'linear_down' | 'midtone_peak' | 'midtone_valley';
+
+export type RotationLogic = 'constant' | 'brightness' | 'coordinate' | 'random';
+
+export interface DitherSettings {
+  aspectRatio: AspectRatio;
+  gridResolution: number; // grid size (width/height cells)
+  backgroundColor: string;
+  invert: boolean;
+  scaleLogic: ScaleLogic;
+  minScale: number;
+  maxScale: number;
+  rotationLogic: RotationLogic;
+  baseRotation: number;    // in degrees (0-360)
+  snapTo90: boolean;      // True to snap the rotated cell rotation to nearest 90 deg
+  gamma: number;           // contrast/brightness tuning
+}

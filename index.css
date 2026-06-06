@@ -1,0 +1,479 @@
+import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { Play, Pause, Download, Volume2, VolumeX, Image as ImageIcon, Sparkles } from 'lucide-react';
+import { DitherSettings, DitherShape } from '../types';
+
+interface DitherCanvasProps {
+  settings: DitherSettings;
+  shapes: DitherShape[];
+  sourceFile: File | null;
+  presetImageUrl: string | null;
+}
+
+export const DitherCanvas: React.FC<DitherCanvasProps> = ({
+  settings,
+  shapes,
+  sourceFile,
+  presetImageUrl,
+}) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mainCanvasRef = useRef<HTMLCanvasElement>(null);
+  const hiddenImageRef = useRef<HTMLImageElement>(null);
+  const hiddenVideoRef = useRef<HTMLVideoElement>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  // Tracks the active object URL so we only revoke it when we replace it,
+  // never prematurely during a re-render.
+  const activeObjectUrlRef = useRef<string | null>(null);
+
+  const [sourceType, setSourceType] = useState<'image' | 'video' | null>(null);
+  const [isVideoPlaying, setIsVideoPlaying] = useState<boolean>(false);
+  const [videoDuration, setVideoDuration] = useState<number>(0);
+  const [videoProgress, setVideoProgress] = useState<number>(0);
+  const [isMuted, setIsMuted] = useState<boolean>(true);
+  const [imageLoaded, setImageLoaded] = useState<boolean>(false);
+  const [compiledImages, setCompiledImages] = useState<(HTMLImageElement | HTMLCanvasElement)[]>([]);
+  const [isCompiling, setIsCompiling] = useState<boolean>(false);
+
+  // ── Compile SVGs into rasterised canvases whenever shapes change ──────────
+  useEffect(() => {
+    let active = true;
+    setIsCompiling(true);
+
+    const compileAll = async () => {
+      try {
+        const promises = shapes.map((shape) =>
+          new Promise<HTMLCanvasElement>((resolve) => {
+            let colorized = shape.svgContent.replace(/currentColor/gi, shape.color);
+            if (!colorized.includes('xmlns=')) {
+              colorized = colorized.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"');
+            }
+
+            const blob = new Blob([colorized], { type: 'image/svg+xml;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const img = new Image();
+
+            img.onload = () => {
+              // Rasterise THEN revoke – order matters.
+              const cache = document.createElement('canvas');
+              cache.width = 100;
+              cache.height = 100;
+              const ctx = cache.getContext('2d');
+              if (ctx) ctx.drawImage(img, 0, 0, 100, 100);
+              URL.revokeObjectURL(url);
+              resolve(cache);
+            };
+
+            img.onerror = () => {
+              URL.revokeObjectURL(url);
+              // Solid-colour fallback canvas
+              const cache = document.createElement('canvas');
+              cache.width = 100;
+              cache.height = 100;
+              const ctx = cache.getContext('2d');
+              if (ctx) { ctx.fillStyle = shape.color; ctx.fillRect(0, 0, 100, 100); }
+              resolve(cache);
+            };
+
+            img.src = url;
+          })
+        );
+
+        const compiled = await Promise.all(promises);
+        if (active) {
+          setCompiledImages(compiled);
+          setIsCompiling(false);
+        }
+      } catch (err) {
+        console.error('Error compiling shapes:', err);
+        if (active) setIsCompiling(false);
+      }
+    };
+
+    compileAll();
+    return () => { active = false; };
+  }, [shapes]);
+
+  // ── Load source file or preset ────────────────────────────────────────────
+  // BUG FIXED: The original code returned a cleanup that called
+  // URL.revokeObjectURL inside the useEffect.  React runs that cleanup on
+  // *every* re-render (not just unmount), so the blob URL was destroyed the
+  // moment any state changed (e.g. imageLoaded → true), killing the image
+  // mid-load and producing the blank white screen / crash.
+  //
+  // Fix: we manage the URL lifetime ourselves via activeObjectUrlRef.
+  // We revoke the *previous* URL at the start of each new load, and revoke
+  // the final URL only on component unmount.
+  useEffect(() => {
+    // Stop any running animation loop
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+
+    // Reset per-source state
+    setImageLoaded(false);
+    setIsVideoPlaying(false);
+
+    // Safe to revoke the previous URL now – we're done with it
+    if (activeObjectUrlRef.current) {
+      URL.revokeObjectURL(activeObjectUrlRef.current);
+      activeObjectUrlRef.current = null;
+    }
+
+    if (sourceFile) {
+      const type = sourceFile.type.startsWith('video/') ? 'video' : 'image';
+      setSourceType(type);
+
+      const url = URL.createObjectURL(sourceFile);
+      activeObjectUrlRef.current = url; // keep alive until next source change
+
+      if (type === 'image' && hiddenImageRef.current) {
+        hiddenImageRef.current.src = url;
+      } else if (type === 'video' && hiddenVideoRef.current) {
+        hiddenVideoRef.current.src = url;
+        hiddenVideoRef.current.load();
+      }
+      // No cleanup return here — we must NOT revoke url on re-render.
+    } else if (presetImageUrl) {
+      setSourceType('image');
+      if (hiddenImageRef.current) {
+        hiddenImageRef.current.src = presetImageUrl;
+      }
+    } else {
+      setSourceType(null);
+    }
+  }, [sourceFile, presetImageUrl]);
+
+  // Revoke the final URL when the component unmounts
+  useEffect(() => {
+    return () => {
+      if (activeObjectUrlRef.current) {
+        URL.revokeObjectURL(activeObjectUrlRef.current);
+      }
+    };
+  }, []);
+
+  // ── Video event listeners ─────────────────────────────────────────────────
+  useEffect(() => {
+    const video = hiddenVideoRef.current;
+    if (!video) return;
+
+    const onDurationChange = () => setVideoDuration(video.duration || 0);
+    const onTimeUpdate    = () => setVideoProgress(video.currentTime || 0);
+    const onEnded         = () => setIsVideoPlaying(false);
+
+    video.addEventListener('durationchange', onDurationChange);
+    video.addEventListener('timeupdate',     onTimeUpdate);
+    video.addEventListener('ended',          onEnded);
+
+    return () => {
+      video.removeEventListener('durationchange', onDurationChange);
+      video.removeEventListener('timeupdate',     onTimeUpdate);
+      video.removeEventListener('ended',          onEnded);
+    };
+  }, []);
+
+  // ── Core dither renderer ──────────────────────────────────────────────────
+  // BUG FIXED: was a plain function defined inside the component body, so every
+  // render produced a new closure that captured stale state.  Wrapped in
+  // useCallback so effects always call the current version.
+  const renderDither = useCallback(() => {
+    const canvas = mainCanvasRef.current;
+    if (!canvas || compiledImages.length < 7 || isCompiling) return;
+
+    let sourceEl: HTMLImageElement | HTMLVideoElement | null = null;
+    let originalWidth = 0;
+    let originalHeight = 0;
+
+    if (sourceType === 'image') {
+      const img = hiddenImageRef.current;
+      if (img && imageLoaded && img.naturalWidth > 0) {
+        sourceEl = img;
+        originalWidth = img.naturalWidth;
+        originalHeight = img.naturalHeight;
+      } else {
+        return;
+      }
+    } else if (sourceType === 'video') {
+      const video = hiddenVideoRef.current;
+      if (video && video.readyState >= 2 && video.videoWidth > 0) {
+        sourceEl = video;
+        originalWidth = video.videoWidth;
+        originalHeight = video.videoHeight;
+      } else {
+        return;
+      }
+    }
+
+    if (!sourceEl || originalWidth === 0 || originalHeight === 0) return;
+
+    const start = performance.now();
+
+    let cols = Math.max(4, Math.min(settings.gridResolution, 256));
+    let rows = settings.aspectRatio === '1x1'
+      ? cols
+      : Math.max(4, Math.min(Math.round(cols * (originalHeight / originalWidth)), 256));
+
+    // Reuse a shared offscreen canvas to reduce GC pressure
+    let offscreen: HTMLCanvasElement = (window as any)._ditherOffscreen;
+    if (!offscreen) {
+      offscreen = document.createElement('canvas');
+      (window as any)._ditherOffscreen = offscreen;
+    }
+    if (offscreen.width  !== cols) offscreen.width  = cols;
+    if (offscreen.height !== rows) offscreen.height = rows;
+
+    const offCtx = offscreen.getContext('2d');
+    if (!offCtx) return;
+
+    if (settings.aspectRatio === '1x1') {
+      const min = Math.min(originalWidth, originalHeight);
+      offCtx.drawImage(sourceEl,
+        (originalWidth  - min) / 2, (originalHeight - min) / 2, min, min,
+        0, 0, cols, rows
+      );
+    } else {
+      offCtx.drawImage(sourceEl, 0, 0, cols, rows);
+    }
+
+    const pixels = offCtx.getImageData(0, 0, cols, rows).data;
+
+    const cellSize = 16;
+    const newW = cols * cellSize;
+    const newH = rows * cellSize;
+    if (canvas.width  !== newW) canvas.width  = newW;
+    if (canvas.height !== newH) canvas.height = newH;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.fillStyle = settings.backgroundColor;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const idx = (r * cols + c) * 4;
+        let brightness = (0.299 * pixels[idx] + 0.587 * pixels[idx + 1] + 0.114 * pixels[idx + 2]) / 255;
+
+        if (settings.invert) brightness = 1 - brightness;
+        if (settings.gamma !== 1) brightness = Math.pow(Math.max(0, brightness), settings.gamma);
+
+        const shapeIndex = Math.min(6, Math.max(0, Math.floor(brightness * 7)));
+        const img = compiledImages[shapeIndex];
+        if (!img) continue;
+
+        const { minScale, maxScale, scaleLogic } = settings;
+        let sFactor = maxScale;
+        if (scaleLogic === 'linear_up')       sFactor = minScale + (maxScale - minScale) * brightness;
+        else if (scaleLogic === 'linear_down') sFactor = maxScale - (maxScale - minScale) * brightness;
+        else if (scaleLogic === 'midtone_peak') {
+          const d = Math.abs(brightness - 0.5) * 2;
+          sFactor = minScale + (maxScale - minScale) * (1 - d);
+        } else if (scaleLogic === 'midtone_valley') {
+          const d = Math.abs(brightness - 0.5) * 2;
+          sFactor = minScale + (maxScale - minScale) * d;
+        }
+
+        let angleDeg = settings.baseRotation;
+        if      (settings.rotationLogic === 'brightness')  angleDeg += brightness * 360;
+        else if (settings.rotationLogic === 'coordinate')  angleDeg += (c + r) * 45;
+        else if (settings.rotationLogic === 'random') {
+          const rnd = (Math.sin(c * 12.9898 + r * 78.233) * 43758.5453) % 1;
+          angleDeg += Math.abs(rnd) * 360;
+        }
+        if (settings.snapTo90) angleDeg = Math.round(angleDeg / 90) * 90;
+
+        const cellX    = c * cellSize + cellSize / 2;
+        const cellY    = r * cellSize + cellSize / 2;
+        const drawSize = cellSize * sFactor;
+
+        ctx.save();
+        ctx.translate(cellX, cellY);
+        ctx.rotate((angleDeg * Math.PI) / 180);
+        ctx.drawImage(img, -drawSize / 2, -drawSize / 2, drawSize, drawSize);
+        ctx.restore();
+      }
+    }
+
+    const elapsed = performance.now() - start;
+    const telemetry = document.getElementById('telemetry-latency');
+    if (telemetry) telemetry.textContent = Math.round(elapsed) + 'ms';
+  }, [sourceType, settings, compiledImages, isCompiling, imageLoaded]);
+
+  // ── Render loop ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+
+    if (sourceType === 'video' && isVideoPlaying) {
+      const loop = () => {
+        renderDither();
+        animationFrameRef.current = requestAnimationFrame(loop);
+      };
+      animationFrameRef.current = requestAnimationFrame(loop);
+    } else {
+      renderDither();
+    }
+
+    return () => {
+      if (animationFrameRef.current !== null) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+    };
+  }, [renderDither, isVideoPlaying]);
+
+  // ── Controls ──────────────────────────────────────────────────────────────
+  const togglePlay = () => {
+    const video = hiddenVideoRef.current;
+    if (!video) return;
+    if (isVideoPlaying) {
+      video.pause();
+      setIsVideoPlaying(false);
+    } else {
+      video.play()
+        .then(() => setIsVideoPlaying(true))
+        .catch((err) => console.warn('Playback error:', err));
+    }
+  };
+
+  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const video = hiddenVideoRef.current;
+    if (!video) return;
+    video.currentTime = parseFloat(e.target.value);
+    setVideoProgress(video.currentTime);
+    setTimeout(() => renderDither(), 50);
+  };
+
+  const toggleMute = () => {
+    const video = hiddenVideoRef.current;
+    if (!video) return;
+    video.muted = !isMuted;
+    setIsMuted(!isMuted);
+  };
+
+  const downloadImage = () => {
+    const canvas = mainCanvasRef.current;
+    if (!canvas) return;
+    const link = document.createElement('a');
+    link.download = `dither_studio_${Date.now()}.png`;
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+  };
+
+  // ── JSX ───────────────────────────────────────────────────────────────────
+  return (
+    <div className="flex flex-col h-full bg-[#0a0a0c] rounded-xl border border-white/10 p-5 min-h-[460px] shadow-xl" id="canvas-container-root">
+
+      {/* Hidden media holders */}
+      <img
+        ref={hiddenImageRef}
+        className="hidden"
+        alt="hidden source"
+        onLoad={() => setImageLoaded(true)}
+        onError={() => { console.error('Image failed to load'); setImageLoaded(false); }}
+      />
+      <video
+        ref={hiddenVideoRef}
+        className="hidden"
+        loop
+        muted={isMuted}
+        playsInline
+        onLoadedData={() => setTimeout(() => renderDither(), 50)}
+      />
+
+      {/* Canvas viewport */}
+      <div
+        ref={containerRef}
+        className="flex-1 flex items-center justify-center min-h-[280px] bg-black rounded-lg border border-white/5 overflow-auto relative p-4 max-h-[580px] group"
+        style={{ scrollbarWidth: 'thin' }}
+      >
+        {!sourceType ? (
+          <div className="flex flex-col items-center text-center space-y-4 max-w-sm p-6">
+            <div className="w-12 h-12 rounded-xl bg-indigo-500/10 flex items-center justify-center border border-indigo-500/15 text-indigo-400">
+              <Sparkles className="w-6 h-6 animate-pulse" />
+            </div>
+            <div className="space-y-1">
+              <h3 className="text-slate-200 font-semibold uppercase tracking-wider text-xs">No media source detected</h3>
+              <p className="text-[10px] text-slate-500 uppercase tracking-wide font-mono leading-normal">
+                Upload custom frames, loops or select an instant demo reference set from below to calibrate the dither grids.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center flex-1 w-full justify-center">
+            {isCompiling && (
+              <div className="absolute inset-0 bg-black/85 backdrop-blur-sm z-10 flex items-center justify-center gap-2">
+                <div className="w-4 h-4 rounded-full border border-t-transparent border-indigo-500 animate-spin" />
+                <span className="text-[10px] text-slate-300 font-mono uppercase tracking-widest">Compiling Vector SVGs...</span>
+              </div>
+            )}
+            <canvas
+              id="dither-main-display"
+              ref={mainCanvasRef}
+              className="max-w-full max-h-[480px] shadow-2xl rounded bg-black object-contain border border-white/10 transition-all duration-300"
+              style={{ imageRendering: 'pixelated' }}
+            />
+          </div>
+        )}
+
+        {sourceType && (
+          <div className="absolute bottom-3 right-3 bg-black/95 border border-white/10 rounded px-2.5 py-1 text-[9px] font-mono text-slate-400 backdrop-blur-md flex items-center gap-3 uppercase tracking-wider">
+            <span className="flex items-center gap-1 font-semibold text-slate-300">
+              <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
+              {sourceType}
+            </span>
+            <span>GRID: {settings.gridResolution}C</span>
+            <span>LATENCY: <span id="telemetry-latency">0ms</span></span>
+          </div>
+        )}
+      </div>
+
+      {/* Media controls */}
+      {sourceType && (
+        <div className="mt-4 space-y-3 bg-[#0a0a0c] p-3 rounded-lg border border-white/5" id="media-viewport-panel">
+          {sourceType === 'video' && (
+            <div className="flex items-center gap-3 text-[10px] font-mono text-slate-400 uppercase tracking-widest">
+              <span className="w-10 text-right">{Math.floor(videoProgress / 60)}:{Math.floor(videoProgress % 60).toString().padStart(2, '0')}</span>
+              <input
+                type="range" min={0} max={videoDuration || 100} step={0.05} value={videoProgress}
+                onChange={handleSeek}
+                className="flex-1 h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-indigo-500 outline-none hover:bg-white/20 transition"
+              />
+              <span className="w-10 text-left">{Math.floor(videoDuration / 60)}:{Math.floor(videoDuration % 60).toString().padStart(2, '0')}</span>
+            </div>
+          )}
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex items-center gap-2">
+              {sourceType === 'video' && (
+                <>
+                  <button onClick={togglePlay}
+                    className="p-2 h-9 w-9 flex items-center justify-center rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition-all cursor-pointer">
+                    {isVideoPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 fill-current ml-0.5" />}
+                  </button>
+                  <button onClick={toggleMute}
+                    className="p-2 h-9 w-9 flex items-center justify-center rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-slate-300 transition-all cursor-pointer">
+                    {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+                  </button>
+                </>
+              )}
+              {sourceType === 'image' && (
+                <div className="flex items-center gap-2 text-[9px] font-mono text-slate-400 bg-black px-3 py-1.5 rounded-lg border border-white/5 uppercase tracking-widest">
+                  <ImageIcon className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>01 // Static Render Feed</span>
+                </div>
+              )}
+            </div>
+            <button onClick={downloadImage}
+              className="px-4 h-9 flex items-center gap-2 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-slate-100 font-bold transition-all text-[10px] uppercase tracking-widest cursor-pointer">
+              <Download className="w-3.5 h-3.5" />
+              <span>Snapshot</span>
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
